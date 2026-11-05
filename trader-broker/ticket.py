@@ -14,14 +14,16 @@ things around the one moment that matters, your yes:
   decline   records a no.
   result    records what happened after the Allow once / Deny card:
             placed (with the broker's order id), denied, or failed.
-  fill      adds a filled order to trader/portfolio.json as a tax lot.
+  fill      adds a filled order to trader/portfolio.json as a purchase (with
+            its Bank of Canada CAD rate and commission) for trader-tax; a
+            sell goes through trader-tax so the ACB stays at average cost.
   log       prints today's decisions.
 
     python3 ticket.py show                    # every order, READY or not
     python3 ticket.py show --index 1 --json   # one ticket as JSON
     python3 ticket.py approve --index 1 --reply "yes"
     python3 ticket.py result --index 1 --status placed --broker-id 61e6...
-    python3 ticket.py fill --symbol AAPL --side buy --qty 3.6628 --price 341.27
+    python3 ticket.py fill --symbol AAPL --side buy --qty 3 --price 341.27 --fx 1.3812 --fee 1 --account tfsa
     python3 ticket.py log
 
 Everything is written to trader/state/broker.json (append only).
@@ -228,28 +230,49 @@ def status_of(order, risk, state, today):
 
 # ---------------------------------------------------------------- rendering
 
+DRAFT_BROKERS = {"ibkr": "Interactive Brokers", "questrade": "Questrade"}
+CAD_SUFFIXES = (".TO", ".V", ".NE", ".CN")
+
+
+def broker_of(cfg):
+    return str(cfg.get("broker", "alpaca")).lower()
+
+
+def broker_name(cfg):
+    return DRAFT_BROKERS.get(broker_of(cfg), "Alpaca")
+
+
+def market_line(order):
+    """Where it trades and in what currency, plus the account it is for."""
+    sym = str(order.get("symbol", "")).upper()
+    cad = any(sym.endswith(x) for x in CAD_SUFFIXES) or str(order.get("currency", "")).upper() == "CAD"
+    where = "TSX/Canadian listing, CAD" if cad else "US listing, USD (your broker converts CAD unless you hold USD)"
+    acct = str(order.get("account") or "personal").upper()
+    acct = {"PERSONAL": "personal non-registered", "CORP": "CORPORATION account"}.get(acct, acct)
+    return "%s; account: %s" % (where, acct)
+
 def render(order, idx, total, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+    broker = broker_of(cfg)
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca"),
-             "  " + plain(order)]
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, broker_name(cfg)),
+             "  " + plain(order), "  " + market_line(order)]
     if order.get("why"):
         lines.append("  why: " + order["why"])
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
-        lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
-        lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+    if broker in DRAFT_BROKERS:
+        lines.append("  Claude drafts this with the %s connector. %s sends it to your" % (broker_name(cfg), broker_name(cfg)))
+        lines.append("  account, and it only goes to the market after you approve it there.")
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
             lines.append("    " + l)
     if ready:
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
-        if broker != "ibkr":
+        if broker not in DRAFT_BROKERS:
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
     return "\n".join(lines), ready
 
@@ -264,8 +287,26 @@ def ticket_json(order, idx, cfg, risk, state, today):
 
 # ---------------------------------------------------------------- fills -> lots
 
-def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
-    """Record a filled order in trader/portfolio.json (a lot for a buy, FIFO for a sell)."""
+def _tax_module():
+    """trader-tax's lots.py, so a sell is recorded at average cost (Canadian ACB)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-tax", "lots.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("trader_tax_lots", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _same_account(p, account):
+    return str(p.get("account") or "personal").lower() == account
+
+
+def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, fx=None, fee=None, account="personal",
+               state_path="trader/state/tax.json"):
+    """Record a filled order in trader/portfolio.json: a purchase for a buy; for a
+    sell, the shares leave at average cost and trader-tax logs the gain or loss."""
     pf = read_json(portfolio_path, "portfolio", required=False)
     if pf is None:
         budget = cfg.get("budget")
@@ -273,38 +314,64 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
             raise TicketError("no %s yet and no budget in the config to start it from" % portfolio_path)
         pf = {"cash": float(budget), "positions": []}
     symbol = symbol.upper()
+    account = (account or "personal").lower()
     qty, price = float(qty), float(price)
+    fee = float(fee or 0)
     cost = round(qty * price, 2)
     pos = None
     for p in pf.setdefault("positions", []):
-        if str(p.get("ticker", "")).upper() == symbol:
+        if str(p.get("ticker", "")).upper() == symbol and _same_account(p, account):
             pos = p
     if side == "buy":
         if pos is None:
             pos = {"ticker": symbol, "shares": 0.0, "lots": []}
+            if account != "personal":
+                pos["account"] = account
             pf["positions"].append(pos)
         lots = pos.setdefault("lots", [])
-        lots.append({"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost})
+        lot = {"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost}
+        if fx is not None:
+            lot["fx"] = float(fx)
+        if fee:
+            lot["fee"] = fee
+        lots.append(lot)
         pos["shares"] = round(float(pos.get("shares", 0)) + qty, 6)
-        pf["cash"] = round(float(pf.get("cash", 0)) - cost, 2)
-    else:
-        if pos is None or float(pos.get("shares", 0)) + 1e-9 < qty:
-            raise TicketError("cannot record selling %s %s: the portfolio holds %s"
-                              % (qty, symbol, pos.get("shares", 0) if pos else 0))
-        left = qty
-        for lot in sorted(pos.get("lots", []), key=lambda l: l.get("date", "")):
-            if left <= 1e-9:
-                break
-            take = min(left, float(lot["shares"]))
-            per = float(lot["cost"]) / float(lot["shares"]) if float(lot["shares"]) else 0
-            lot["cost"] = round(float(lot["cost"]) - per * take, 2)
-            lot["shares"] = round(float(lot["shares"]) - take, 6)
-            left -= take
-        pos["lots"] = [l for l in pos.get("lots", []) if float(l["shares"]) > 1e-9]
-        pos["shares"] = round(float(pos["shares"]) - qty, 6)
-        if pos["shares"] <= 1e-9:
-            pf["positions"].remove(pos)
-        pf["cash"] = round(float(pf.get("cash", 0)) + cost, 2)
+        if account == "personal":
+            pf["cash"] = round(float(pf.get("cash", 0)) - cost - fee, 2)
+        write_json(portfolio_path, pf)
+        return pf
+    if pos is None or float(pos.get("shares", 0)) + 1e-9 < qty:
+        raise TicketError("cannot record selling %s %s: the portfolio holds %s"
+                          % (qty, symbol, pos.get("shares", 0) if pos else 0))
+    tax = _tax_module()
+    if tax is not None:
+        try:
+            hs = tax.holdings(pf)
+            h = tax.find(hs, symbol, account)
+            if h["pool"]:
+                rate = 1.0 if h["currency"] == "CAD" else (float(fx) if fx is not None else None)
+                if rate is None:
+                    raise TicketError("a sell of a %s stock needs --fx (Bank of Canada CAD rate on %s; "
+                                      "trader-tax: lots.py fx --date %s)" % (h["currency"], date, date))
+                state = read_json(state_path, "tax state", required=False) or {"realized": []}
+                sale = tax.simulate_sale(hs, h, qty, price, rate, fee, datetime.date.fromisoformat(date))
+                tax.record_sale(pf, h, sale, datetime.date.fromisoformat(date), state)
+                write_json(portfolio_path, pf)
+                write_json(state_path, state)
+                return pf
+        except tax.TaxError as e:
+            raise TicketError("trader-tax: %s" % e)
+    # registered account (or no trader-tax): shrink every purchase pro rata
+    f = qty / float(pos["shares"])
+    for lot in pos.get("lots", []):
+        lot["shares"] = round(float(lot["shares"]) * (1 - f), 6)
+        lot["cost"] = round(float(lot["cost"]) * (1 - f), 2)
+    pos["lots"] = [l for l in pos.get("lots", []) if float(l["shares"]) > 1e-9]
+    pos["shares"] = round(float(pos["shares"]) - qty, 6)
+    if pos["shares"] <= 1e-9:
+        pf["positions"].remove(pos)
+    if account == "personal":
+        pf["cash"] = round(float(pf.get("cash", 0)) + cost - fee, 2)
     write_json(portfolio_path, pf)
     return pf
 
@@ -366,8 +433,9 @@ def cmd_approve(a):
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
-        print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+    if broker_of(cfg) in DRAFT_BROKERS:
+        print("Now draft it with the %s connector, for the %s; approve it in your %s account."
+              % (broker_name(cfg), market_line(order).split("account: ")[1], broker_name(cfg)))
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
@@ -405,20 +473,24 @@ def cmd_result(a):
     write_json(a.state, state)
     print("Recorded order %d as %s." % (a.index, a.status))
     if a.status == "placed" and a.filled_qty and a.filled_price:
-        apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today)
+        apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today,
+                   a.fx, a.fee, order.get("account") or "personal")
         print("Added the fill to %s." % a.portfolio)
     elif a.status == "placed":
-        print("When it fills, record it for trader-tax: ticket.py fill --symbol %s --side %s --qty Q --price P"
-              % (rec["symbol"], rec["side"]))
+        print("When it fills, record it for trader-tax: ticket.py fill --symbol %s --side %s --qty Q --price P "
+              "--fx RATE --fee F --account %s" % (rec["symbol"], rec["side"], order.get("account") or "personal"))
     return 0
 
 
 def cmd_fill(a):
     cfg = read_json(a.config, "config", required=False) or {}
     date = a.date or datetime.date.today().isoformat()
-    pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date)
-    print("Recorded %s %s %s at %s on %s. Cash now %s." % (a.side, a.qty, a.symbol.upper(),
-                                                          _money(a.price), date, _money(pf["cash"])))
+    pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date, a.fx, a.fee, a.account)
+    print("Recorded %s %s %s at %s on %s (%s account). Cash now %s." % (a.side, a.qty, a.symbol.upper(),
+          _money(a.price), date, a.account, _money(pf["cash"])))
+    if a.fx is None and not any(a.symbol.upper().endswith(x) for x in CAD_SUFFIXES) and a.account in ("personal", "corp"):
+        print("No --fx given: trader-tax needs the Bank of Canada CAD rate for this purchase "
+              "(lots.py fx --date %s), add it as \"fx\" on the lot." % date)
     return 0
 
 
@@ -469,6 +541,8 @@ def main(argv=None):
     p.add_argument("--note")
     p.add_argument("--filled-qty")
     p.add_argument("--filled-price")
+    p.add_argument("--fx", help="Bank of Canada CAD rate on the trade date (USD stocks)")
+    p.add_argument("--fee", help="commission, in the stock's currency")
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p = sub.add_parser("fill", help="add a filled order to trader/portfolio.json")
     p.add_argument("--symbol", required=True)
@@ -476,6 +550,10 @@ def main(argv=None):
     p.add_argument("--qty", required=True)
     p.add_argument("--price", required=True)
     p.add_argument("--date")
+    p.add_argument("--fx", type=float, help="Bank of Canada CAD rate on the trade date (USD stocks)")
+    p.add_argument("--fee", type=float, help="commission, in the stock's currency")
+    p.add_argument("--account", default="personal",
+                   choices=["personal", "corp", "tfsa", "rrsp", "rrif", "fhsa", "resp", "spouse"])
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--config", default="trader/config.json")
     p = sub.add_parser("log", help="today's decisions")

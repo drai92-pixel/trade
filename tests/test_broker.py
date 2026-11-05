@@ -199,26 +199,55 @@ class Flow(unittest.TestCase):
         self.assertIn("after you approve it there", text)
         self.assertNotIn("place_stock_order", text)
 
-    def test_fill_sell_relieves_the_oldest_lot(self):
+    def test_fill_sell_is_average_cost_and_logs_the_gain(self):
         pf = {"cash": 0, "positions": [{"ticker": "KO", "shares": 3, "lots": [
-            {"id": "KO-1", "date": "2025-01-02", "shares": 2, "cost": 120.0},
-            {"id": "KO-2", "date": "2026-01-02", "shares": 1, "cost": 70.0}]}]}
+            {"id": "KO-1", "date": "2025-01-02", "shares": 2, "cost": 120.0, "fx": 1.40},
+            {"id": "KO-2", "date": "2026-01-02", "shares": 1, "cost": 70.0, "fx": 1.30}]}]}
         with open(self.pf, "w") as fh:
             json.dump(pf, fh)
-        code, text, _ = run(["fill", "--symbol", "KO", "--side", "sell", "--qty", "2.5", "--price", "90",
-                             "--date", TODAY, "--portfolio", self.pf, "--config", self.cfg])
-        self.assertEqual(code, 0)
+        tax_state = os.path.join(self.d, "tax.json")
+        code, _, err = run(["fill", "--symbol", "KO", "--side", "sell", "--qty", "2.5", "--price", "90",
+                            "--date", TODAY, "--portfolio", self.pf, "--config", self.cfg])
+        self.assertEqual(code, 1)
+        self.assertIn("--fx", err)
+        ticket.apply_fill(self.pf, {}, "KO", "sell", 2.5, 90, TODAY, fx=1.40, state_path=tax_state)
         with open(self.pf) as fh:
             pf = json.load(fh)
         self.assertEqual(pf["cash"], 225.0)
         lots = pf["positions"][0]["lots"]
-        self.assertEqual([l["id"] for l in lots], ["KO-2"])
-        self.assertEqual(lots[0]["shares"], 0.5)
-        self.assertEqual(lots[0]["cost"], 35.0)
+        self.assertEqual([l["id"] for l in lots], ["KO-1", "KO-2"])      # both shrink pro rata
+        self.assertAlmostEqual(sum(l["shares"] for l in lots), 0.5, places=6)
+        with open(tax_state) as fh:
+            st = json.load(fh)
+        acb = (120 * 1.40 + 70 * 1.30) / 3 * 2.5
+        self.assertAlmostEqual(st["realized"][0]["gain_cad"], round(2.5 * 90 * 1.40 - acb, 2), places=2)
         code, _, err = run(["fill", "--symbol", "KO", "--side", "sell", "--qty", "5", "--price", "90",
-                            "--portfolio", self.pf, "--config", self.cfg])
+                            "--fx", "1.4", "--portfolio", self.pf, "--config", self.cfg])
         self.assertEqual(code, 1)
 
+    def test_fill_buy_records_fx_fee_and_account(self):
+        code, text, _ = run(["fill", "--symbol", "RY.TO", "--side", "buy", "--qty", "5", "--price", "170",
+                             "--date", TODAY, "--account", "tfsa", "--fee", "1", "--portfolio", self.pf,
+                             "--config", self.cfg])
+        self.assertEqual(code, 0)
+        self.assertNotIn("No --fx", text)          # CAD stock needs no rate
+        with open(self.pf) as fh:
+            pf = json.load(fh)
+        pos = [p for p in pf["positions"] if p["ticker"] == "RY.TO"][0]
+        self.assertEqual(pos["account"], "tfsa")
+        self.assertEqual(pos["lots"][0]["fee"], 1.0)
+
+    def test_questrade_and_account_on_the_ticket(self):
+        with open(self.cfg) as fh:
+            c = json.load(fh)
+        c["broker"] = "questrade"
+        with open(self.cfg, "w") as fh:
+            json.dump(c, fh)
+        self.run_risk()
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertIn("Questrade", text)
+        self.assertIn("account: personal non-registered", text)
+        self.assertNotIn("place_stock_order", text)
 
 if __name__ == "__main__":
     unittest.main()

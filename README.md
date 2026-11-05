@@ -14,6 +14,27 @@ disclose, the minute the filing posts.
 And no trade goes through until you say yes. Nothing in this pack can place an
 order on its own. Paper trading is the default.
 
+
+## Canadian edition
+
+This copy is adapted for Canadian investors:
+
+- **trader-tax** follows Canadian rules: adjusted cost base at average cost in
+  CAD (each purchase and sale at its own Bank of Canada rate, `lots.py fx`),
+  one pool per taxpayer across non-registered accounts and interlisted
+  listings, the taxable half of capital gains, and the superficial loss rule
+  across your spouse, your corporation, TFSA and RRSP. Accounts: `personal`,
+  `corp`, `tfsa`, `rrsp`, `rrif`, `fhsa`, `resp`, `spouse`.
+- **trader-broker** drafts orders with the Interactive Brokers or Questrade
+  connector (you approve each one in your broker), shows the listing, currency
+  and account on every ticket, and records fills with their CAD rate.
+  Start from `trader-budget/config.canada.example.json`.
+- The research skills (copycat, pelosi, news, analyst, screener) still cover
+  US markets and SEC filings only.
+
+Install: `/plugin marketplace add <your fork>` then `/plugin install trader-skill-ca@trader-skill-ca`.
+Not tax or financial advice.
+
 ## Install
 
 Paste this into Claude:
